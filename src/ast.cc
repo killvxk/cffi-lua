@@ -9,9 +9,7 @@
 namespace ast {
 
 /* This unholy spaghetti implements integer promotions as well as conversion
- * rules in arithmetic operations etc. as the C standard defines it... it does
- * not handle errors yet (FIXME) and only covers types that can be emitted by
- * literals (i.e. no handling of names and so on).
+ * rules in arithmetic operations etc. as the C standard defines it...
  */
 
 static void promote_int(c_value &v, c_expr_type &et) {
@@ -26,7 +24,8 @@ static void promote_int(c_value &v, c_expr_type &et) {
 }
 
 /* only integers have ranks but for our purposes this is fine */
-static int get_rank(c_expr_type type) {
+static int get_rank(lua_State *L, c_expr_type type) WARN_UNUSED_RET;
+static int get_rank(lua_State *L, c_expr_type type) {
     switch (type) {
         case c_expr_type::INT: return 0;
         case c_expr_type::UINT: return 0;
@@ -37,11 +36,14 @@ static int get_rank(c_expr_type type) {
         case c_expr_type::FLOAT: return 3;
         case c_expr_type::DOUBLE: return 4;
         case c_expr_type::LDOUBLE: return 5;
-        default: assert(false); break;
+        default:
+            lua_pushliteral(L, "invalid type for operand");
+            break;
     }
     return -1;
 }
 
+static bool is_signed(c_expr_type type) WARN_UNUSED_RET;
 static bool is_signed(c_expr_type type) {
     switch (type) {
         case c_expr_type::CHAR:
@@ -59,20 +61,29 @@ static bool is_signed(c_expr_type type) {
     return false;
 }
 
-static void convert_bin(
-    c_value &lval, c_expr_type &let, c_value &rval, c_expr_type &ret
+static bool convert_bin(
+    lua_State *L, c_value &lval, c_expr_type &let, c_value &rval,
+    c_expr_type &ret
+) WARN_UNUSED_RET;
+
+static bool convert_bin(
+    lua_State *L, c_value &lval, c_expr_type &let, c_value &rval,
+    c_expr_type &ret
 ) {
     /* same types, likely case, bail out early */
     if (let == ret) {
-        return;
+        return true;
     }
 
-    int lrank = get_rank(let);
-    int rrank = get_rank(ret);
+    int lrank = get_rank(L, let);
+    int rrank = get_rank(L, ret);
+    if ((lrank < 0) || (rrank < 0)) {
+        return false;
+    }
 
     /* if right operand is higher ranked, treat it as left operand */
     if (rrank > lrank) {
-        return convert_bin(rval, ret, lval, let);
+        return convert_bin(L, rval, ret, lval, let);
     }
 
 #define CONVERT_RVAL(lv) { \
@@ -95,11 +106,11 @@ static void convert_bin(
     /* left operand is a float, convert to it */
     switch (let) {
         case c_expr_type::LDOUBLE:
-            CONVERT_RVAL(ld); ret = let; return;
+            CONVERT_RVAL(ld); ret = let; return true;
         case c_expr_type::DOUBLE:
-            CONVERT_RVAL(d); ret = let; return;
+            CONVERT_RVAL(d); ret = let; return true;
         case c_expr_type::FLOAT:
-            CONVERT_RVAL(f); ret = let; return;
+            CONVERT_RVAL(f); ret = let; return true;
         default:
             break;
     }
@@ -113,40 +124,38 @@ static void convert_bin(
     if (lsig == rsig) {
         switch (let) {
             case c_expr_type::ULLONG:
-                CONVERT_RVAL(ull); ret = let; return;
+                CONVERT_RVAL(ull); ret = let; return true;
             case c_expr_type::LLONG:
-                CONVERT_RVAL(ll); ret = let; return;
+                CONVERT_RVAL(ll); ret = let; return true;
             case c_expr_type::ULONG:
-                CONVERT_RVAL(ul); ret = let; return;
+                CONVERT_RVAL(ul); ret = let; return true;
             case c_expr_type::LONG:
-                CONVERT_RVAL(l); ret = let; return;
+                CONVERT_RVAL(l); ret = let; return true;
             case c_expr_type::UINT:
-                CONVERT_RVAL(u); ret = let; return;
+                CONVERT_RVAL(u); ret = let; return true;
             case c_expr_type::INT:
-                CONVERT_RVAL(i); ret = let; return;
+                CONVERT_RVAL(i); ret = let; return true;
             default:
                 break;
         }
-        /* should be unreachable */
-        assert(false);
-        return;
+        LUA_BUG_MSG(L, "unreachable code");
+        return false;
     }
 
     /* unsigned type has greater or equal rank */
     if (rsig) {
         switch (let) {
             case c_expr_type::ULLONG:
-                CONVERT_RVAL(ull); ret = let; return;
+                CONVERT_RVAL(ull); ret = let; return true;
             case c_expr_type::ULONG:
-                CONVERT_RVAL(ul); ret = let; return;
+                CONVERT_RVAL(ul); ret = let; return true;
             case c_expr_type::UINT:
-                CONVERT_RVAL(u); ret = let; return;
+                CONVERT_RVAL(u); ret = let; return true;
             default:
                 break;
         }
-        /* should be unreachable */
-        assert(false);
-        return;
+        LUA_BUG_MSG(L, "unreachable code");
+        return false;
     }
 
 #define CONVERT_RVAL_BOUNDED(lv) \
@@ -155,14 +164,14 @@ static void convert_bin(
             if (sizeof(unsigned long) < sizeof(lval.lv)) { \
                 rval.lv = rval.ul; \
                 ret = let; \
-                return; \
+                return true; \
             } \
             break; \
         case c_expr_type::UINT: \
             if (sizeof(unsigned int) < sizeof(lval.lv)) { \
                 rval.lv = rval.u; \
                 ret = let; \
-                return; \
+                return true; \
             } \
             break; \
         default: \
@@ -191,100 +200,136 @@ static void convert_bin(
             lval.ull = lval.ll;
             CONVERT_RVAL(ull);
             let = ret = c_expr_type::ULLONG;
-            return;
+            return true;
         case c_expr_type::LONG:
             lval.ul = lval.l;
             CONVERT_RVAL(ul);
             let = ret = c_expr_type::ULONG;
-            return;
+            return true;
         case c_expr_type::INT:
             lval.u = lval.i;
             CONVERT_RVAL(u);
             let = ret = c_expr_type::UINT;
-            return;
+            return true;
         default:
             break;
     }
 
 #undef CONVERT_RVAL
 
-    /* unreachable */
-    assert(false);
+    LUA_BUG_MSG(L, "unreachable code");
+    return false;
 }
 
-static c_value eval_unary(c_expr const &e, c_expr_type &et) {
-    c_value baseval = e.un.expr->eval(et);
+static bool eval_unary(
+    lua_State *L, c_value &baseval, c_expr const &e, c_expr_type &et
+) WARN_UNUSED_RET;
+
+static bool eval_unary(
+    lua_State *L, c_value &baseval, c_expr const &e, c_expr_type &et
+) {
+    if (!e.un.expr->eval(L, baseval, et, false)) {
+        return false;
+    }
     switch (e.un.op) {
         case c_expr_unop::UNP:
             promote_int(baseval, et);
-            break;
+            switch (et) {
+                case c_expr_type::INT:
+                case c_expr_type::UINT:
+                case c_expr_type::LONG:
+                case c_expr_type::ULONG:
+                case c_expr_type::LLONG:
+                case c_expr_type::ULLONG:
+                    return true;
+                default: break;
+            }
+            lua_pushliteral(L, "invalid type for +(expr)");
+            return false;
         case c_expr_unop::UNM:
             promote_int(baseval, et);
             switch (et) {
-                case c_expr_type::INT: baseval.i = -baseval.i; break;
+                case c_expr_type::INT: baseval.i = -baseval.i; return true;
                 case c_expr_type::UINT:
                     if (baseval.u) {
                         baseval.u = UINT_MAX - baseval.u + 1;
                     }
-                    break;
-                case c_expr_type::LONG: baseval.l = -baseval.l; break;
+                    return true;
+                case c_expr_type::LONG: baseval.l = -baseval.l; return true;
                 case c_expr_type::ULONG:
                     if (baseval.ul) {
                         baseval.ul = ULONG_MAX - baseval.ul + 1;
                     }
-                    break;
-                case c_expr_type::LLONG: baseval.ll = -baseval.ll; break;
+                    return true;
+                case c_expr_type::LLONG: baseval.ll = -baseval.ll; return true;
                 case c_expr_type::ULLONG:
                     if (baseval.ull) {
                         baseval.ull = ULLONG_MAX - baseval.ull + 1;
                     }
-                    break;
+                    return true;
                 default: break;
             }
-            break;
+            lua_pushliteral(L, "invalid type for -(expr)");
+            return false;
         case c_expr_unop::NOT:
             switch (et) {
-                case c_expr_type::BOOL: baseval.b = !baseval.b; break;
-                case c_expr_type::CHAR: baseval.c = !baseval.c; break;
-                case c_expr_type::INT: baseval.i = !baseval.i; break;
-                case c_expr_type::UINT: baseval.u = !baseval.u; break;
-                case c_expr_type::LONG: baseval.l = !baseval.l; break;
-                case c_expr_type::ULONG: baseval.ul = !baseval.ul; break;
-                case c_expr_type::LLONG: baseval.ll = !baseval.ll; break;
-                case c_expr_type::ULLONG: baseval.ull = !baseval.ull; break;
+                case c_expr_type::BOOL: baseval.b = !baseval.b; return true;
+                case c_expr_type::CHAR: baseval.c = !baseval.c; return true;
+                case c_expr_type::INT: baseval.i = !baseval.i; return true;
+                case c_expr_type::UINT: baseval.u = !baseval.u; return true;
+                case c_expr_type::LONG: baseval.l = !baseval.l; return true;
+                case c_expr_type::ULONG: baseval.ul = !baseval.ul; return true;
+                case c_expr_type::LLONG: baseval.ll = !baseval.ll; return true;
+                case c_expr_type::ULLONG:
+                    baseval.ull = !baseval.ull; return true;
                 default: break;
             }
-            break;
+            lua_pushliteral(L, "invalid type for !(expr)");
+            return false;
         case c_expr_unop::BNOT:
             promote_int(baseval, et);
             switch (et) {
-                case c_expr_type::INT: baseval.i = ~baseval.i; break;
-                case c_expr_type::UINT: baseval.u = ~baseval.u; break;
-                case c_expr_type::LONG: baseval.l = ~baseval.l; break;
-                case c_expr_type::ULONG: baseval.ul = ~baseval.ul; break;
-                case c_expr_type::LLONG: baseval.ll = ~baseval.ll; break;
-                case c_expr_type::ULLONG: baseval.ull = ~baseval.ull; break;
+                case c_expr_type::INT: baseval.i = ~baseval.i; return true;
+                case c_expr_type::UINT: baseval.u = ~baseval.u; return true;
+                case c_expr_type::LONG: baseval.l = ~baseval.l; return true;
+                case c_expr_type::ULONG: baseval.ul = ~baseval.ul; return true;
+                case c_expr_type::LLONG: baseval.ll = ~baseval.ll; return true;
+                case c_expr_type::ULLONG:
+                    baseval.ull = ~baseval.ull; return true;
                 default: break;
             }
-            break;
+            lua_pushliteral(L, "invalid type for ~(expr)");
+            return false;
         default:
-            assert(false);
             break;
     }
-    return baseval;
+    LUA_BUG_MSG(L, "unreachable code");
+    return false;
 }
 
-static c_value eval_binary(c_expr const &e, c_expr_type &et) {
+static bool eval_binary(
+    lua_State *L, c_value &retv, c_expr const &e, c_expr_type &et
+) WARN_UNUSED_RET;
+
+static bool eval_binary(
+    lua_State *L, c_value &retv, c_expr const &e, c_expr_type &et
+) {
     c_expr_type let, ret;
-    c_value lval = e.bin.lhs->eval(let);
-    c_value rval = e.bin.rhs->eval(ret);
-    c_value retv{};
+    c_value lval, rval;
+    if (!e.bin.lhs->eval(L, lval, let, false)) {
+        return false;
+    }
+    if (!e.bin.rhs->eval(L, rval, ret, false)) {
+        return false;
+    }
 
 #define BINOP_CASE(opn, op) \
     case c_expr_binop::opn: \
         promote_int(lval, let); \
         promote_int(rval, ret); \
-        convert_bin(lval, let, rval, ret); \
+        if (!convert_bin(L, lval, let, rval, ret)) { \
+            return false; \
+        } \
         et = let; \
         switch (let) { \
             case c_expr_type::INT: retv.i = lval.i op rval.i; break; \
@@ -296,7 +341,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             case c_expr_type::FLOAT: retv.f = lval.f op rval.f; break; \
             case c_expr_type::DOUBLE: retv.d = lval.d op rval.d; break; \
             case c_expr_type::LDOUBLE: retv.ld = lval.ld op rval.ld; break; \
-            default: assert(false); break; \
+            default: \
+                lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+                return false; \
         } \
         break;
 
@@ -304,7 +351,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
     case c_expr_binop::opn: \
         promote_int(lval, let); \
         promote_int(rval, ret); \
-        convert_bin(lval, let, rval, ret); \
+        if (!convert_bin(L, lval, let, rval, ret)) { \
+            return false; \
+        } \
         et = c_expr_type::BOOL; \
         switch (let) { \
             case c_expr_type::INT: retv.b = lval.i op rval.i; break; \
@@ -316,7 +365,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             case c_expr_type::FLOAT: retv.b = lval.f op rval.f; break; \
             case c_expr_type::DOUBLE: retv.b = lval.d op rval.d; break; \
             case c_expr_type::LDOUBLE: retv.b = lval.ld op rval.ld; break; \
-            default: assert(false); break; \
+            default: \
+                lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+                return false; \
         } \
         break;
 
@@ -324,7 +375,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
     case c_expr_binop::opn: \
         promote_int(lval, let); \
         promote_int(rval, ret); \
-        convert_bin(lval, let, rval, ret); \
+        if (!convert_bin(L, lval, let, rval, ret)) { \
+            return false; \
+        } \
         et = let; \
         switch (let) { \
             case c_expr_type::INT: retv.i = lval.i op rval.i; break; \
@@ -336,9 +389,11 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             case c_expr_type::FLOAT: \
             case c_expr_type::DOUBLE: \
             case c_expr_type::LDOUBLE: \
-                assert(false); \
-                break; \
-            default: assert(false); break; \
+                lua_pushliteral(L, "operator " #op " cannot be applied to floating point types"); \
+                return false; \
+            default: \
+                lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+                return false; \
         } \
         break;
 
@@ -370,7 +425,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             } \
             break; \
         case c_expr_type::ULLONG: retv.fn = lval.fn op rval.ull; break; \
-        default: assert(false); break; \
+        default: \
+            lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+            return false; \
     }
 
 #define SHIFT_CASE(opn, op, nop) \
@@ -385,7 +442,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             case c_expr_type::ULONG: SHIFT_CASE_INNER(ul, op, nop); break; \
             case c_expr_type::LLONG: SHIFT_CASE_INNER(ll, op, nop); break; \
             case c_expr_type::ULLONG: SHIFT_CASE_INNER(ull, op, nop); break; \
-            default: assert(false); break; \
+            default: \
+                lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+                return false; \
         } \
         break;
 
@@ -404,7 +463,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
         case c_expr_type::CHAR: retv.b = lv op rval.c; break; \
         case c_expr_type::NULLPTR: retv.b = lv op nullptr; break; \
         case c_expr_type::BOOL: retv.b = lv op rval.b; break; \
-        default: assert(false); break; \
+        default: \
+            lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+            return false; \
     }
 
 #define BOOL_CASE(opn, op) \
@@ -424,7 +485,9 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
             case c_expr_type::CHAR: BOOL_CASE_INNER(lval.c, op); break; \
             case c_expr_type::NULLPTR: BOOL_CASE_INNER(nullptr, op); break; \
             case c_expr_type::BOOL: BOOL_CASE_INNER(lval.b, op); break; \
-            default: assert(false); break; \
+            default: \
+                lua_pushliteral(L, "invalid type(s) for (expr1 " #op " expr2)"); \
+                return false; \
         } \
         break;
 
@@ -452,8 +515,10 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
         SHIFT_CASE(RSH, >>, <<)
 
         default:
-            assert(false);
-            break;
+            LUA_BUG_MSG(L, "unhandled operator ");
+            lua_pushfstring(L, "%d", int(e.bin.op));
+            lua_concat(L, 2);
+            return false;
     }
 
 #undef BOOL_CASE
@@ -463,12 +528,21 @@ static c_value eval_binary(c_expr const &e, c_expr_type &et) {
 #undef CMP_BOOL_CASE
 #undef BINOP_CASE
 
-    return retv;
+    return true;
 }
 
-static c_value eval_ternary(c_expr const &e, c_expr_type &et) {
+static bool eval_ternary(
+    lua_State *L, c_value &ret, c_expr const &e, c_expr_type &et
+) WARN_UNUSED_RET;
+
+static bool eval_ternary(
+    lua_State *L, c_value &ret, c_expr const &e, c_expr_type &et
+) {
     c_expr_type cet;
-    c_value cval = e.tern.cond->eval(cet);
+    c_value cval;
+    if (!e.tern.cond->eval(L, cval, cet, false)) {
+        return false;
+    }
     bool tval = false;
     switch (cet) {
         case c_expr_type::INT: tval = cval.i; break;
@@ -485,51 +559,66 @@ static c_value eval_ternary(c_expr const &e, c_expr_type &et) {
         case c_expr_type::NULLPTR: tval = false; break;
         case c_expr_type::BOOL: tval = cval.b; break;
         default:
-            assert(false);
-            break;
+            lua_pushliteral(L, "invalid ternary condition");
+            return false;
     }
     if (tval) {
-        return e.tern.texpr->eval(et, true);
+        return e.tern.texpr->eval(L, ret, et, true);
     }
-    return e.tern.fexpr->eval(et, true);
+    return e.tern.fexpr->eval(L, ret, et, true);
 }
 
-c_value c_expr::eval(c_expr_type &et, bool promote) const {
-    c_value ret;
-    switch (type()) {
+static bool c_expr_eval(
+    lua_State *L, c_value &ret, c_expr const &ce, c_expr_type &et, bool promote
+) WARN_UNUSED_RET;
+
+static bool c_expr_eval(
+    lua_State *L, c_value &ret, c_expr const &ce, c_expr_type &et, bool promote
+) {
+    switch (ce.type()) {
         case c_expr_type::BINARY:
-            return eval_binary(*this, et);
+            return eval_binary(L, ret, ce, et);
         case c_expr_type::UNARY:
-            return eval_unary(*this, et);
+            return eval_unary(L, ret, ce, et);
         case c_expr_type::TERNARY:
-            return eval_ternary(*this, et);
+            return eval_ternary(L, ret, ce, et);
         case c_expr_type::INT:
-            ret.i = val.i; et = c_expr_type::INT; break;
+            ret.i = ce.val.i; et = c_expr_type::INT; break;
         case c_expr_type::UINT:
-            ret.u = val.u; et = c_expr_type::UINT; break;
+            ret.u = ce.val.u; et = c_expr_type::UINT; break;
         case c_expr_type::LONG:
-            ret.l = val.l; et = c_expr_type::LONG; break;
+            ret.l = ce.val.l; et = c_expr_type::LONG; break;
         case c_expr_type::ULONG:
-            ret.ul = val.ul; et = c_expr_type::ULONG; break;
+            ret.ul = ce.val.ul; et = c_expr_type::ULONG; break;
         case c_expr_type::LLONG:
-            ret.ll = val.ll; et = c_expr_type::LLONG; break;
+            ret.ll = ce.val.ll; et = c_expr_type::LLONG; break;
         case c_expr_type::ULLONG:
-            ret.ull = val.ull; et = c_expr_type::ULLONG; break;
+            ret.ull = ce.val.ull; et = c_expr_type::ULLONG; break;
         case c_expr_type::FLOAT:
-            ret.f = val.f; et = c_expr_type::FLOAT; break;
+            ret.f = ce.val.f; et = c_expr_type::FLOAT; break;
         case c_expr_type::DOUBLE:
-            ret.d = val.d; et = c_expr_type::DOUBLE; break;
+            ret.d = ce.val.d; et = c_expr_type::DOUBLE; break;
         case c_expr_type::CHAR:
-            ret.c = val.c; et = c_expr_type::CHAR; break;
+            ret.c = ce.val.c; et = c_expr_type::CHAR; break;
         case c_expr_type::BOOL:
-            ret.b = val.b; et = c_expr_type::BOOL; break;
+            ret.b = ce.val.b; et = c_expr_type::BOOL; break;
         default:
-            ret.i = 0; et = c_expr_type::INVALID; break;
+            ret.i = 0; et = c_expr_type::INVALID;
+            lua_pushliteral(L, "invalid expression type");
+            return false;
     }
     if (promote) {
         promote_int(ret, et);
     }
-    return ret;
+    return true;
+}
+
+bool c_expr::eval(
+    lua_State *L, c_value &v, c_expr_type &et, bool promote
+) const {
+    /* clear first */
+    v = c_value{};
+    return c_expr_eval(L, v, *this, et, promote);
 }
 
 /* params ignore continuation func */
